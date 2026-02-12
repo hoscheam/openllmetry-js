@@ -15,12 +15,11 @@
  */
 
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
+import { Serialized } from "@langchain/core/load/serializable";
 import { BaseMessage } from "@langchain/core/messages";
 import { LLMResult } from "@langchain/core/outputs";
-import { Serialized } from "@langchain/core/load/serializable";
 import { ChainValues } from "@langchain/core/utils/types";
-import { Tracer, SpanKind, SpanStatusCode } from "@opentelemetry/api";
-import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
+import { SpanKind, SpanStatusCode, Tracer } from "@opentelemetry/api";
 import {
   ATTR_GEN_AI_COMPLETION,
   ATTR_GEN_AI_PROMPT,
@@ -30,11 +29,16 @@ import {
   ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
+import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
 
 interface SpanData {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   span: any;
   runId: string;
+  startTime: number;
+  firstTokenTime?: number;
+  // Store model name from the LLM object passed to handleChatModelStart
+  modelFromConfig?: string;
 }
 
 export class TraceloopCallbackHandler extends BaseCallbackHandler {
@@ -60,9 +64,17 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     _metadata?: Record<string, unknown>,
     _runName?: string,
   ): Promise<void> {
-    const className = llm.id?.[llm.id.length - 1] || "unknown";
+    const startTime = Date.now();
+
+    // Use detected class name which checks multiple sources for accurate detection
+    const detectedClassName = this.detectClassName(llm);
+    const className =
+      detectedClassName || llm.id?.[llm.id.length - 1] || "unknown";
     const vendor = this.detectVendor(llm);
     const spanBaseName = this.convertClassNameToSpanName(className);
+
+    // Try to extract model name from the LLM config at start time
+    const modelFromConfig = this.extractModelNameFromConfig(llm);
 
     // Create single LLM span like Python implementation
     const span = this.tracer.startSpan(spanBaseName, {
@@ -89,7 +101,12 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       });
     }
 
-    this.spans.set(runId, { span, runId });
+    this.spans.set(runId, {
+      span,
+      runId,
+      startTime,
+      modelFromConfig: modelFromConfig || undefined,
+    });
   }
 
   override async handleLLMStart(
@@ -102,9 +119,17 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     _metadata?: Record<string, unknown>,
     _runName?: string,
   ): Promise<void> {
-    const className = llm.id?.[llm.id.length - 1] || "unknown";
+    const startTime = Date.now();
+
+    // Use detected class name which checks multiple sources for accurate detection
+    const detectedClassName = this.detectClassName(llm);
+    const className =
+      detectedClassName || llm.id?.[llm.id.length - 1] || "unknown";
     const vendor = this.detectVendor(llm);
     const spanBaseName = this.convertClassNameToSpanName(className);
+
+    // Try to extract model name from the LLM config at start time
+    const modelFromConfig = this.extractModelNameFromConfig(llm);
 
     // Create single LLM span like handleChatModelStart
     const span = this.tracer.startSpan(spanBaseName, {
@@ -125,7 +150,41 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       });
     }
 
-    this.spans.set(runId, { span, runId });
+    this.spans.set(runId, {
+      span,
+      runId,
+      startTime,
+      modelFromConfig: modelFromConfig || undefined,
+    });
+  }
+
+  /**
+   * Handle new token for streaming - track time to first token
+   */
+  override async handleLLMNewToken(
+    token: string,
+    _idx?: unknown,
+    runId?: string,
+    _parentRunId?: string,
+    _tags?: string[],
+    _fields?: unknown,
+  ): Promise<void> {
+    if (!runId) return;
+
+    const spanData = this.spans.get(runId);
+    if (!spanData) return;
+
+    // Record first token time if not already set
+    if (!spanData.firstTokenTime) {
+      spanData.firstTokenTime = Date.now();
+      const timeToFirstToken = spanData.firstTokenTime - spanData.startTime;
+
+      // Set time to first token attribute (in milliseconds)
+      spanData.span.setAttributes({
+        "gen_ai.response.time_to_first_token_ms": timeToFirstToken,
+        "llm.response.time_to_first_token": timeToFirstToken / 1000, // Also in seconds
+      });
+    }
   }
 
   override async handleLLMEnd(
@@ -138,7 +197,15 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     const spanData = this.spans.get(runId);
     if (!spanData) return;
 
-    const { span } = spanData;
+    const { span, startTime, modelFromConfig } = spanData;
+    const endTime = Date.now();
+    const totalDuration = endTime - startTime;
+
+    // Set duration/latency attributes
+    span.setAttributes({
+      "gen_ai.response.duration_ms": totalDuration,
+      "llm.response.duration": totalDuration / 1000, // In seconds
+    });
 
     if (
       this.traceContent &&
@@ -155,10 +222,11 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       });
     }
 
-    // Extract model name from response only, like Python implementation
-    const modelName = this.extractModelNameFromResponse(output);
+    // Extract model name from response, falling back to config model
+    const modelFromResponse = this.extractModelNameFromResponse(output);
+    const modelName = modelFromResponse || modelFromConfig;
 
-    // Set both request and response model attributes like Python implementation
+    // Set both request and response model attributes
     span.setAttributes({
       [ATTR_GEN_AI_REQUEST_MODEL]: modelName || "unknown",
       [ATTR_GEN_AI_RESPONSE_MODEL]: modelName || "unknown",
@@ -249,6 +317,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     runType?: string,
     runName?: string,
   ): Promise<void> {
+    const startTime = Date.now();
     const chainName = chain.id?.[chain.id.length - 1] || "unknown";
     const spanName = `${chainName}.workflow`;
 
@@ -267,7 +336,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       });
     }
 
-    this.spans.set(runId, { span, runId });
+    this.spans.set(runId, { span, runId, startTime });
   }
 
   override async handleChainEnd(
@@ -319,6 +388,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     _metadata?: Record<string, unknown>,
     _runName?: string,
   ): Promise<void> {
+    const startTime = Date.now();
     const toolName = tool.id?.[tool.id.length - 1] || "unknown";
     const spanName = `${toolName}.task`;
 
@@ -337,7 +407,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       });
     }
 
-    this.spans.set(runId, { span, runId });
+    this.spans.set(runId, { span, runId, startTime });
   }
 
   override async handleToolEnd(
@@ -378,15 +448,105 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     this.spans.delete(runId);
   }
 
+  /**
+   * Extract model name from the LLM configuration object (at start time)
+   */
+  private extractModelNameFromConfig(llm: Serialized): string | null {
+    const llmAny = llm as unknown as Record<string, unknown>;
+    const kwargs = llmAny.kwargs as Record<string, unknown> | undefined;
+
+    // Check kwargs first (most common pattern in LangChain v1)
+    if (kwargs) {
+      // Azure deployment name (this is typically the model)
+      if (
+        kwargs.azureOpenAIApiDeploymentName &&
+        typeof kwargs.azureOpenAIApiDeploymentName === "string"
+      ) {
+        return kwargs.azureOpenAIApiDeploymentName;
+      }
+      // Standard model name fields
+      const modelName =
+        kwargs.model_name ||
+        kwargs.modelName ||
+        kwargs.model ||
+        kwargs.deployment_name ||
+        kwargs.deploymentName;
+      if (modelName && typeof modelName === "string") {
+        return modelName;
+      }
+    }
+
+    // Check direct properties on the llm object
+    if (
+      llmAny.azureOpenAIApiDeploymentName &&
+      typeof llmAny.azureOpenAIApiDeploymentName === "string"
+    ) {
+      return llmAny.azureOpenAIApiDeploymentName;
+    }
+    const directModel =
+      llmAny.model_name ||
+      llmAny.modelName ||
+      llmAny.model ||
+      llmAny.deployment_name ||
+      llmAny.deploymentName;
+    if (directModel && typeof directModel === "string") {
+      return directModel;
+    }
+
+    return null;
+  }
+
   private extractModelNameFromResponse(output: LLMResult): string | null {
-    // Follow Python implementation - extract from llm_output first
+    // Check llmOutput first (multiple possible field names)
     if (output.llmOutput) {
+      // Check various snake_case and camelCase variants
       const modelName =
         output.llmOutput.model_name ||
+        output.llmOutput.modelName ||
         output.llmOutput.model_id ||
+        output.llmOutput.modelId ||
         output.llmOutput.model;
       if (modelName && typeof modelName === "string") {
         return modelName;
+      }
+    }
+
+    // Check generations for response_metadata (LangChain v1 pattern)
+    if (output.generations && output.generations.length > 0) {
+      const firstGen = output.generations[0];
+      if (firstGen && firstGen.length > 0) {
+        const generation = firstGen[0] as {
+          message?: {
+            response_metadata?: {
+              model_name?: string;
+              modelName?: string;
+              model?: string;
+            };
+          };
+          generationInfo?: {
+            model_name?: string;
+            modelName?: string;
+            model?: string;
+          };
+        };
+
+        // Check response_metadata on the message (LangChain v1 chat models)
+        if (generation.message?.response_metadata) {
+          const meta = generation.message.response_metadata;
+          const model = meta.model_name || meta.modelName || meta.model;
+          if (model && typeof model === "string") {
+            return model;
+          }
+        }
+
+        // Check generationInfo (older pattern)
+        if (generation.generationInfo) {
+          const info = generation.generationInfo;
+          const model = info.model_name || info.modelName || info.model;
+          if (model && typeof model === "string") {
+            return model;
+          }
+        }
       }
     }
 
@@ -402,8 +562,93 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     });
   }
 
+  /**
+   * Detect the actual class name by checking multiple sources:
+   * 1. Azure-specific properties (azureOpenAIApiKey, azureOpenAIApiDeploymentName, etc.)
+   * 2. kwargs for Azure-specific properties
+   * 3. Constructor name
+   * 4. Fallback to serialized id
+   */
+  private detectClassName(llm: Serialized): string | null {
+    // Type-safe access to llm properties
+    const llmAny = llm as unknown as Record<string, unknown>;
+    const kwargs = llmAny.kwargs as Record<string, unknown> | undefined;
+
+    // Check _llmType() for Azure detection
+    if (kwargs) {
+      // Check for Azure-specific properties in kwargs
+      if (
+        kwargs.azureOpenAIApiKey ||
+        kwargs.azureOpenAIApiDeploymentName ||
+        kwargs.azureOpenAIApiInstanceName ||
+        kwargs.azureOpenAIEndpoint ||
+        kwargs.azureADTokenProvider
+      ) {
+        return "AzureChatOpenAI";
+      }
+    }
+
+    // Check for Azure properties directly on the llm object
+    // This handles cases where the llm is passed with configuration
+    if (
+      llmAny.azureOpenAIApiKey ||
+      llmAny.azureOpenAIApiDeploymentName ||
+      llmAny.azureOpenAIApiInstanceName ||
+      llmAny.azureOpenAIEndpoint ||
+      llmAny.azureADTokenProvider
+    ) {
+      return "AzureChatOpenAI";
+    }
+
+    // Check constructor name if available
+    if (
+      llmAny.constructor &&
+      typeof llmAny.constructor === "function" &&
+      (llmAny.constructor as { name?: string }).name
+    ) {
+      const constructorName = (llmAny.constructor as { name: string }).name;
+      if (constructorName !== "Object" && constructorName !== "Function") {
+        return constructorName;
+      }
+    }
+
+    // Fallback to serialized id
+    return llm.id?.[llm.id.length - 1] || null;
+  }
+
   private detectVendor(llm: Serialized): string {
-    const className = llm.id?.[llm.id.length - 1] || "";
+    // First, use the detected class name for more accurate vendor detection
+    const detectedClassName = this.detectClassName(llm);
+    const className = detectedClassName || llm.id?.[llm.id.length - 1] || "";
+
+    // Type-safe access to llm properties
+    const llmAny = llm as unknown as Record<string, unknown>;
+    const kwargs = llmAny.kwargs as Record<string, unknown> | undefined;
+
+    // Also check for Azure properties directly - this is the most reliable method
+    // for LangChain v1 where wrapper classes are used
+    if (kwargs) {
+      if (
+        kwargs.azureOpenAIApiKey ||
+        kwargs.azureOpenAIApiDeploymentName ||
+        kwargs.azureOpenAIApiInstanceName ||
+        kwargs.azureOpenAIEndpoint ||
+        kwargs.azureADTokenProvider
+      ) {
+        return "Azure";
+      }
+    }
+
+    // Check Azure properties directly on the llm object
+    if (
+      llmAny.azureOpenAIApiKey ||
+      llmAny.azureOpenAIApiDeploymentName ||
+      llmAny.azureOpenAIApiInstanceName ||
+      llmAny.azureOpenAIEndpoint ||
+      llmAny.azureADTokenProvider
+    ) {
+      return "Azure";
+    }
 
     if (!className) {
       return "Langchain";
