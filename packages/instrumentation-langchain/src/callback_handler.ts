@@ -22,6 +22,7 @@ import { ChainValues } from "@langchain/core/utils/types";
 import { SpanKind, SpanStatusCode, Tracer } from "@opentelemetry/api";
 import {
   ATTR_GEN_AI_COMPLETION,
+  ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_PROMPT,
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_RESPONSE_MODEL,
@@ -84,6 +85,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     const flatMessages = messages.flat();
     span.setAttributes({
       [ATTR_GEN_AI_SYSTEM]: vendor,
+      [ATTR_GEN_AI_OPERATION_NAME]: "chat",
       [SpanAttributes.LLM_REQUEST_TYPE]: "chat",
     });
 
@@ -138,6 +140,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
 
     span.setAttributes({
       [ATTR_GEN_AI_SYSTEM]: vendor,
+      [ATTR_GEN_AI_OPERATION_NAME]: "chat",
       [SpanAttributes.LLM_REQUEST_TYPE]: "completion",
     });
 
@@ -232,6 +235,21 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       [ATTR_GEN_AI_RESPONSE_MODEL]: modelName || "unknown",
     });
 
+    // Extract and set finish_reason - critical for Dynatrace AI Observability to determine success
+    const finishReason = this.extractFinishReason(output);
+    if (finishReason) {
+      span.setAttributes({
+        "gen_ai.response.finish_reason": finishReason,
+        "gen_ai.response.finish_reasons": [finishReason], // Array format for compatibility
+      });
+    } else {
+      // Default to "stop" if no finish_reason found but response completed successfully
+      span.setAttributes({
+        "gen_ai.response.finish_reason": "stop",
+        "gen_ai.response.finish_reasons": ["stop"],
+      });
+    }
+
     // Add usage metrics if available
     if (output.llmOutput?.usage) {
       const usage = output.llmOutput.usage;
@@ -274,7 +292,9 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       }
     }
 
-    span.setStatus({ code: SpanStatusCode.OK });
+    // Do NOT set span.status for successful spans - Dynatrace AI Observability
+    // considers spans with isNull(span.status_code) as successful.
+    // Setting SpanStatusCode.OK causes Dynatrace to count the span as a failure.
     span.end();
     this.spans.delete(runId);
   }
@@ -357,7 +377,8 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       });
     }
 
-    span.setStatus({ code: SpanStatusCode.OK });
+    // Do NOT set span.status for successful spans - Dynatrace AI Observability
+    // considers spans with isNull(span.status_code) as successful.
     span.end();
     this.spans.delete(runId);
   }
@@ -397,6 +418,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     });
 
     span.setAttributes({
+      [ATTR_GEN_AI_OPERATION_NAME]: "execute_tool",
       "traceloop.span.kind": "task",
       "traceloop.entity.name": toolName,
     });
@@ -427,7 +449,8 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       });
     }
 
-    span.setStatus({ code: SpanStatusCode.OK });
+    // Do NOT set span.status for successful spans - Dynatrace AI Observability
+    // considers spans with isNull(span.status_code) as successful.
     span.end();
     this.spans.delete(runId);
   }
@@ -491,6 +514,63 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       llmAny.deploymentName;
     if (directModel && typeof directModel === "string") {
       return directModel;
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract finish_reason from LLM output
+   * This is critical for APM tools like Dynatrace to determine if the request was successful
+   */
+  private extractFinishReason(output: LLMResult): string | null {
+    // Check llmOutput first (OpenAI/Azure format)
+    if (output.llmOutput) {
+      // Direct finish_reason field
+      if (output.llmOutput.finish_reason) {
+        return output.llmOutput.finish_reason as string;
+      }
+      // Azure OpenAI format
+      if (output.llmOutput.finishReason) {
+        return output.llmOutput.finishReason as string;
+      }
+    }
+
+    // Check generations for response_metadata (LangChain v1 pattern)
+    if (output.generations && output.generations.length > 0) {
+      const firstGen = output.generations[0];
+      if (firstGen && firstGen.length > 0) {
+        const generation = firstGen[0] as {
+          message?: {
+            response_metadata?: {
+              finish_reason?: string;
+              finishReason?: string;
+            };
+          };
+          generationInfo?: {
+            finish_reason?: string;
+            finishReason?: string;
+          };
+        };
+
+        // Check response_metadata on the message
+        if (generation.message?.response_metadata) {
+          const meta = generation.message.response_metadata;
+          const reason = meta.finish_reason || meta.finishReason;
+          if (reason && typeof reason === "string") {
+            return reason;
+          }
+        }
+
+        // Check generationInfo
+        if (generation.generationInfo) {
+          const info = generation.generationInfo;
+          const reason = info.finish_reason || info.finishReason;
+          if (reason && typeof reason === "string") {
+            return reason;
+          }
+        }
+      }
     }
 
     return null;
