@@ -38,8 +38,10 @@ import {
 } from "@opentelemetry/semantic-conventions/incubating";
 import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
 
-// Metric name following OpenTelemetry Gen AI semantic conventions
+// Metric names following OpenTelemetry Gen AI semantic conventions
 const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
+const METRIC_GEN_AI_CLIENT_OPERATION_DURATION =
+  "gen_ai.client.operation.duration";
 
 interface SpanData {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -58,6 +60,7 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
   private spans: Map<string, SpanData> = new Map();
   private traceContent: boolean;
   private _tokenUsageHistogram: Histogram;
+  private _operationDurationHistogram: Histogram;
 
   constructor(tracer: Tracer, traceContent = true) {
     super();
@@ -71,6 +74,13 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       {
         description: "Measures number of input and output tokens used",
         unit: "{token}",
+      },
+    );
+    this._operationDurationHistogram = meter.createHistogram(
+      METRIC_GEN_AI_CLIENT_OPERATION_DURATION,
+      {
+        description: "Measures the duration of GenAI operations",
+        unit: "s",
       },
     );
   }
@@ -223,11 +233,12 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     const { span, startTime, modelFromConfig } = spanData;
     const endTime = Date.now();
     const totalDuration = endTime - startTime;
+    const durationInSeconds = totalDuration / 1000;
 
     // Set duration/latency attributes
     span.setAttributes({
       "gen_ai.response.duration_ms": totalDuration,
-      "llm.response.duration": totalDuration / 1000, // In seconds
+      "llm.response.duration": durationInSeconds, // In seconds
     });
 
     if (
@@ -353,6 +364,22 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
         });
       }
     }
+
+    // Extract model name for metrics (use already extracted modelName from above)
+    const metricsModelName = modelFromResponse || modelFromConfig || "unknown";
+
+    // Emit operation duration metric
+    const durationMetricAttributes = {
+      [ATTR_GEN_AI_SYSTEM]:
+        span.getAttribute?.(ATTR_GEN_AI_SYSTEM) || "langchain",
+      [ATTR_GEN_AI_REQUEST_MODEL]: metricsModelName,
+      [ATTR_GEN_AI_RESPONSE_MODEL]: metricsModelName,
+      [ATTR_GEN_AI_OPERATION_NAME]: "chat",
+    };
+    this._operationDurationHistogram.record(
+      durationInSeconds,
+      durationMetricAttributes,
+    );
 
     // Do NOT set span.status for successful spans - Dynatrace AI Observability
     // considers spans with isNull(span.status_code) as successful.
