@@ -30,16 +30,8 @@ export class LangChainInstrumentation extends InstrumentationBase {
     super("@traceloop/instrumentation-langchain", version, config);
   }
 
-  public manuallyInstrument({
-    callbackManagerModule,
-  }: {
-    callbackManagerModule?: any;
-  }) {
-    if (callbackManagerModule) {
-      this._diag.debug(
-        "Manually instrumenting @langchain/core/callbacks/manager",
-      );
-    }
+  public override setConfig(config: LangChainInstrumentationConfig = {}) {
+    super.setConfig(config);
   }
 
   protected init(): InstrumentationModuleDefinition[] {
@@ -55,9 +47,98 @@ export class LangChainInstrumentation extends InstrumentationBase {
       "@langchain/community",
     ];
 
-    return modulesToPatch.map((moduleName) =>
+    const llmModuleDefinitions = modulesToPatch.map((moduleName) =>
       this.createModuleDefinition(moduleName),
     );
+
+    // Also patch @langchain/core/callbacks/manager to intercept CallbackManager
+    const callbackManagerModuleDefinition =
+      this.createCallbackManagerModuleDefinition();
+
+    return [...llmModuleDefinitions, callbackManagerModuleDefinition];
+  }
+
+  /**
+   * Create an InstrumentationModuleDefinition for @langchain/core/callbacks/manager
+   * to patch CallbackManager and ensure our callback handler is always added
+   */
+  private createCallbackManagerModuleDefinition(): InstrumentationNodeModuleDefinition {
+    return new InstrumentationNodeModuleDefinition(
+      "@langchain/core/callbacks/manager",
+      [">=0.1.0 <2.0.0"],
+      (moduleExports: Record<string, unknown>, moduleVersion?: string) => {
+        this._diag.debug(
+          `[Traceloop] Applying CallbackManager instrumentation patch for @langchain/core/callbacks/manager@${moduleVersion || "unknown"}`,
+        );
+        this.patchCallbackManagerModule(moduleExports);
+        return moduleExports;
+      },
+      (moduleExports: Record<string, unknown>, moduleVersion?: string) => {
+        this._diag.debug(
+          `[Traceloop] Removing CallbackManager instrumentation patch for @langchain/core/callbacks/manager@${moduleVersion || "unknown"}`,
+        );
+        return moduleExports;
+      },
+    );
+  }
+
+  /**
+   * Patch @langchain/core/callbacks/manager module - specifically the CallbackManager
+   */
+  private patchCallbackManagerModule(module: Record<string, unknown>) {
+    if (!module) return;
+
+    // CallbackManager is directly exported from this module
+    const callbacksManager = module.CallbackManager;
+
+    if (callbacksManager) {
+      this.patchCallbackManager(callbacksManager);
+    } else {
+      this._diag.debug(
+        "[Traceloop] CallbackManager not found in @langchain/core/callbacks/manager",
+      );
+    }
+  }
+
+  /**
+   * Patch CallbackManager.configure to always include our callback handler
+   */
+  private patchCallbackManager(CallbackManagerClass: unknown) {
+    if (!CallbackManagerClass) return;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const CM = CallbackManagerClass as any;
+
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+
+    // Patch configure method
+    if (CM.configure) {
+      const originalConfigure = CM.configure;
+      CM.configure = async function (...args: unknown[]) {
+        self._diag.debug("[Traceloop] CallbackManager.configure called");
+
+        const callbackHandler = new TraceloopCallbackHandler(
+          self.tracer,
+          self._shouldSendPrompts(),
+        );
+
+        // args[1] is localHandlers in the configure signature
+        const localHandlers = args[1] as unknown[] | undefined;
+        const patchedLocalHandlers = localHandlers
+          ? [...localHandlers, callbackHandler]
+          : [callbackHandler];
+
+        // Create new args array with patched localHandlers
+        const patchedArgs = [...args];
+        patchedArgs[1] = patchedLocalHandlers;
+
+        return originalConfigure.apply(this, patchedArgs);
+      };
+      self._diag.debug(
+        "[Traceloop] CallbackManager.configure patched successfully",
+      );
+    }
   }
 
   /**
@@ -165,7 +246,7 @@ export class LangChainInstrumentation extends InstrumentationBase {
       };
     }
 
-    // Patch generate method (used by some LLM calls)
+    // Patch generate method (also used directly by some code)
     if (proto.generate) {
       const originalGenerate = proto.generate as (
         ...args: unknown[]
@@ -186,7 +267,7 @@ export class LangChainInstrumentation extends InstrumentationBase {
       };
     }
 
-    // Patch _generate method (internal method that actually calls the API)
+    // Patch _generate method (internal method called by chains)
     if (proto._generate) {
       const originalInternalGenerate = proto._generate as (
         ...args: unknown[]
@@ -207,22 +288,7 @@ export class LangChainInstrumentation extends InstrumentationBase {
       };
     }
 
-    // Patch _streamIterator method (used by chains when streaming)
-    if (proto._streamIterator) {
-      const originalStreamIterator = proto._streamIterator as (
-        ...args: unknown[]
-      ) => AsyncIterable<unknown>;
-      proto._streamIterator = function (
-        input: unknown,
-        options?: Record<string, unknown>,
-      ) {
-        self._diag.debug(`[Traceloop] ${className}._streamIterator called`);
-        const patchedOptions = self.injectCallbackHandler(options, className);
-        return originalStreamIterator.call(this, input, patchedOptions);
-      };
-    }
-
-    // Patch _call method (used internally by chains)
+    // Patch _call method (used internally by chains via .pipe())
     if (proto._call) {
       const originalCall = proto._call as (
         ...args: unknown[]
@@ -238,7 +304,7 @@ export class LangChainInstrumentation extends InstrumentationBase {
       };
     }
 
-    // Patch _transform method (used when LLM is in a chain/pipe)
+    // Patch _transform method (used when LLM is in a chain/pipe for streaming)
     if (proto._transform) {
       const originalTransform = proto._transform as (
         ...args: unknown[]
@@ -259,26 +325,18 @@ export class LangChainInstrumentation extends InstrumentationBase {
       };
     }
 
-    // Patch _streamResponseChunks (internal Azure/OpenAI streaming method)
-    if (proto._streamResponseChunks) {
-      const originalStreamResponseChunks = proto._streamResponseChunks as (
+    // Patch _streamIterator method (used by chains when streaming via RunnableSequence)
+    if (proto._streamIterator) {
+      const originalStreamIterator = proto._streamIterator as (
         ...args: unknown[]
       ) => AsyncIterable<unknown>;
-      proto._streamResponseChunks = function (
-        messages: unknown,
+      proto._streamIterator = function (
+        input: unknown,
         options?: Record<string, unknown>,
-        runManager?: unknown,
       ) {
-        self._diag.debug(
-          `[Traceloop] ${className}._streamResponseChunks called`,
-        );
+        self._diag.debug(`[Traceloop] ${className}._streamIterator called`);
         const patchedOptions = self.injectCallbackHandler(options, className);
-        return originalStreamResponseChunks.call(
-          this,
-          messages,
-          patchedOptions,
-          runManager,
-        );
+        return originalStreamIterator.call(this, input, patchedOptions);
       };
     }
 

@@ -1,35 +1,35 @@
-import { NodeSDK } from "@opentelemetry/sdk-node";
-import { SpanProcessor } from "@opentelemetry/sdk-trace-node";
+import { TraceExporter as GcpTraceExporter } from "@google-cloud/opentelemetry-cloud-trace-exporter";
 import { context, diag } from "@opentelemetry/api";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
-import { TraceExporter as GcpTraceExporter } from "@google-cloud/opentelemetry-cloud-trace-exporter";
-import { Resource } from "@opentelemetry/resources";
-import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import { Instrumentation } from "@opentelemetry/instrumentation";
-import { InitializeOptions } from "../interfaces";
-import { _configuration } from "../configuration";
+import { Resource } from "@opentelemetry/resources";
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { SpanProcessor } from "@opentelemetry/sdk-trace-node";
+import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import { CONTEXT_KEY_ALLOW_TRACE_CONTENT } from "@traceloop/ai-semantic-conventions";
 import { AnthropicInstrumentation } from "@traceloop/instrumentation-anthropic";
-import { OpenAIInstrumentation } from "@traceloop/instrumentation-openai";
+import { BedrockInstrumentation } from "@traceloop/instrumentation-bedrock";
+import { ChromaDBInstrumentation } from "@traceloop/instrumentation-chromadb";
+import { CohereInstrumentation } from "@traceloop/instrumentation-cohere";
+import { LangChainInstrumentation } from "@traceloop/instrumentation-langchain";
 import { LlamaIndexInstrumentation } from "@traceloop/instrumentation-llamaindex";
+import { McpInstrumentation } from "@traceloop/instrumentation-mcp";
+import { OpenAIInstrumentation } from "@traceloop/instrumentation-openai";
+import { PineconeInstrumentation } from "@traceloop/instrumentation-pinecone";
+import { QdrantInstrumentation } from "@traceloop/instrumentation-qdrant";
+import { TogetherInstrumentation } from "@traceloop/instrumentation-together";
 import {
   AIPlatformInstrumentation,
   VertexAIInstrumentation,
 } from "@traceloop/instrumentation-vertexai";
-import { BedrockInstrumentation } from "@traceloop/instrumentation-bedrock";
-import { CohereInstrumentation } from "@traceloop/instrumentation-cohere";
-import { PineconeInstrumentation } from "@traceloop/instrumentation-pinecone";
-import { LangChainInstrumentation } from "@traceloop/instrumentation-langchain";
-import { ChromaDBInstrumentation } from "@traceloop/instrumentation-chromadb";
-import { QdrantInstrumentation } from "@traceloop/instrumentation-qdrant";
-import { TogetherInstrumentation } from "@traceloop/instrumentation-together";
-import { McpInstrumentation } from "@traceloop/instrumentation-mcp";
+import { _configuration } from "../configuration";
+import { ImageUploader } from "../images";
+import { InitializeOptions } from "../interfaces";
+import { parseKeyPairsIntoRecord } from "./baggage-utils";
 import {
   ALL_INSTRUMENTATION_LIBRARIES,
   createSpanProcessor,
 } from "./span-processor";
-import { parseKeyPairsIntoRecord } from "./baggage-utils";
-import { ImageUploader } from "../images";
 
 let _sdk: NodeSDK;
 let _spanProcessor: SpanProcessor;
@@ -270,6 +270,9 @@ export const startTracing = (options: InitializeOptions) => {
     openAIInstrumentation?.setConfig({
       traceContent: false,
     });
+    anthropicInstrumentation?.setConfig({
+      traceContent: false,
+    });
     llamaIndexInstrumentation?.setConfig({
       traceContent: false,
     });
@@ -289,6 +292,9 @@ export const startTracing = (options: InitializeOptions) => {
       traceContent: false,
     });
     togetherInstrumentation?.setConfig({
+      traceContent: false,
+    });
+    langchainInstrumentation?.setConfig({
       traceContent: false,
     });
   }
