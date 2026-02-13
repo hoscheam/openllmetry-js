@@ -13,18 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import type * as togetherai from "together-ai";
-import { context, trace, Span, Attributes, SpanKind } from "@opentelemetry/api";
+import {
+  Attributes,
+  Histogram,
+  Span,
+  SpanKind,
+  context,
+  metrics,
+  trace,
+} from "@opentelemetry/api";
 import {
   InstrumentationBase,
   InstrumentationModuleDefinition,
   InstrumentationNodeModuleDefinition,
   safeExecuteInTheMiddle,
 } from "@opentelemetry/instrumentation";
-import {
-  CONTEXT_KEY_ALLOW_TRACE_CONTENT,
-  SpanAttributes,
-} from "@traceloop/ai-semantic-conventions";
 import {
   ATTR_GEN_AI_COMPLETION,
   ATTR_GEN_AI_PROMPT,
@@ -37,36 +40,60 @@ import {
   ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
-import { TogetherAIInstrumentationConfig } from "./types";
+import {
+  CONTEXT_KEY_ALLOW_TRACE_CONTENT,
+  SpanAttributes,
+} from "@traceloop/ai-semantic-conventions";
+import type * as togetherai from "together-ai";
 import type { Completion } from "together-ai/resources";
+import { TogetherAIInstrumentationConfig } from "./types";
 
-import type { Stream } from "together-ai/streaming";
-import { version } from "../package.json";
 import { APIPromise } from "together-ai/core";
 import {
-  ChatCompletionChunk,
   ChatCompletion,
-  CompletionCreateParamsStreaming as ChatCompletionCreateParamsStreaming,
+  ChatCompletionChunk,
   CompletionCreateParamsNonStreaming as ChatCompletionCreateParamsNonStreaming,
+  CompletionCreateParamsStreaming as ChatCompletionCreateParamsStreaming,
 } from "together-ai/resources/chat";
+import type { Stream } from "together-ai/streaming";
+import { version } from "../package.json";
 
 import {
-  CompletionCreateParamsStreaming as CompletionCreateParamsStreaming,
-  CompletionCreateParamsNonStreaming as CompletionCreateParamsNonStreaming,
+  CompletionCreateParamsNonStreaming,
+  CompletionCreateParamsStreaming,
 } from "together-ai/resources";
 
 type CompletionCreateParamsStreamingType =
   | ChatCompletionCreateParamsStreaming
   | CompletionCreateParamsStreaming;
 
+// Metric name following OpenTelemetry Gen AI semantic conventions
+const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
+
 export class TogetherInstrumentation extends InstrumentationBase {
   declare protected _config: TogetherAIInstrumentationConfig;
+  private _tokenUsageHistogram!: Histogram;
 
   constructor(config: TogetherAIInstrumentationConfig = {}) {
     super("@traceloop/instrumentation-together-ai", version, {
       enrichTokens: true,
       ...config,
     });
+    this._initMetrics();
+  }
+
+  private _initMetrics(): void {
+    const meter = metrics.getMeter(
+      "@traceloop/instrumentation-together-ai",
+      version,
+    );
+    this._tokenUsageHistogram = meter.createHistogram(
+      METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
+      {
+        description: "Measures number of input and output tokens used",
+        unit: "{token}",
+      },
+    );
   }
 
   public override setConfig(config: TogetherAIInstrumentationConfig = {}) {
@@ -521,6 +548,29 @@ export class TogetherInstrumentation extends InstrumentationBase {
           ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
           result.usage?.prompt_tokens,
         );
+
+        // Emit token usage metrics
+        const metricAttributes = {
+          [ATTR_GEN_AI_SYSTEM]: "togetherai",
+          [ATTR_GEN_AI_REQUEST_MODEL]: result.model,
+          [ATTR_GEN_AI_RESPONSE_MODEL]: result.model,
+        };
+
+        // Record input tokens
+        if (result.usage.prompt_tokens !== undefined) {
+          this._tokenUsageHistogram.record(result.usage.prompt_tokens, {
+            ...metricAttributes,
+            "gen_ai.token.type": "input",
+          });
+        }
+
+        // Record output tokens
+        if (result.usage.completion_tokens !== undefined) {
+          this._tokenUsageHistogram.record(result.usage.completion_tokens, {
+            ...metricAttributes,
+            "gen_ai.token.type": "output",
+          });
+        }
       }
 
       if (this._shouldSendPrompts()) {

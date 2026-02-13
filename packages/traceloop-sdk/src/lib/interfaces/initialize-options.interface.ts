@@ -1,17 +1,18 @@
-import { SpanExporter, SpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { TextMapPropagator, ContextManager } from "@opentelemetry/api";
-import type * as openai from "openai";
 import type * as anthropic from "@anthropic-ai/sdk";
-import type * as cohere from "cohere-ai";
 import type * as bedrock from "@aws-sdk/client-bedrock-runtime";
 import type * as aiplatform from "@google-cloud/aiplatform";
 import type * as vertexAI from "@google-cloud/vertexai";
-import type * as pinecone from "@pinecone-database/pinecone";
-import type * as together from "together-ai";
-import type * as llamaindex from "llamaindex";
-import type * as chromadb from "chromadb";
-import type * as qdrant from "@qdrant/js-client-rest";
 import type * as mcp from "@modelcontextprotocol/sdk/client/index.js";
+import { ContextManager, TextMapPropagator } from "@opentelemetry/api";
+import { PushMetricExporter } from "@opentelemetry/sdk-metrics";
+import { SpanExporter, SpanProcessor } from "@opentelemetry/sdk-trace-base";
+import type * as pinecone from "@pinecone-database/pinecone";
+import type * as qdrant from "@qdrant/js-client-rest";
+import type * as chromadb from "chromadb";
+import type * as cohere from "cohere-ai";
+import type * as llamaindex from "llamaindex";
+import type * as openai from "openai";
+import type * as together from "together-ai";
 
 /**
  * Options for initializing the Traceloop SDK.
@@ -58,6 +59,13 @@ export interface InitializeOptions {
    * Defaults to the OTLP exporter.
    */
   exporter?: SpanExporter;
+
+  /**
+   * The OpenTelemetry MetricExporter to be used for sending metrics data. Optional.
+   * Defaults to the OTLP metric exporter.
+   * Required for Dynatrace: use OTLPMetricExporter with Dynatrace endpoint.
+   */
+  metricsExporter?: PushMetricExporter;
 
   /**
    * The headers to be sent with the traces data. Optional.
@@ -149,4 +157,16 @@ export interface InitializeOptions {
    * This is used to configure the Google Cloud Trace Exporter.
    */
   gcpProjectId?: string;
+
+  /**
+   * The interval in milliseconds for exporting metrics. Optional.
+   * Defaults to 60000 (60 seconds).
+   */
+  metricsExportIntervalMs?: number;
+
+  /**
+   * Whether to enable metrics export. Optional.
+   * Defaults to true.
+   */
+  metricsEnabled?: boolean;
 }

@@ -13,18 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import type * as openai from "openai";
-import { context, trace, Span, Attributes, SpanKind } from "@opentelemetry/api";
+import {
+  Attributes,
+  context,
+  Histogram,
+  metrics,
+  Span,
+  SpanKind,
+  trace,
+} from "@opentelemetry/api";
 import {
   InstrumentationBase,
   InstrumentationModuleDefinition,
   InstrumentationNodeModuleDefinition,
   safeExecuteInTheMiddle,
 } from "@opentelemetry/instrumentation";
-import {
-  CONTEXT_KEY_ALLOW_TRACE_CONTENT,
-  SpanAttributes,
-} from "@traceloop/ai-semantic-conventions";
 import {
   ATTR_GEN_AI_COMPLETION,
   ATTR_GEN_AI_PROMPT,
@@ -37,7 +40,12 @@ import {
   ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
-import { OpenAIInstrumentationConfig } from "./types";
+import {
+  CONTEXT_KEY_ALLOW_TRACE_CONTENT,
+  SpanAttributes,
+} from "@traceloop/ai-semantic-conventions";
+import { encodingForModel, Tiktoken, TiktokenModel } from "js-tiktoken";
+import type * as openai from "openai";
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -50,23 +58,42 @@ import type {
 } from "openai/resources";
 import type { Stream } from "openai/streaming";
 import { version } from "../package.json";
-import { encodingForModel, TiktokenModel, Tiktoken } from "js-tiktoken";
+import {
+  wrapImageEdit,
+  wrapImageGeneration,
+  wrapImageVariation,
+} from "./image-wrappers";
+import { OpenAIInstrumentationConfig } from "./types";
 // Type definition for APIPromise - compatible with both OpenAI v4 and v5+
 // The actual import is handled at runtime via require() calls in the _wrapPromise method
 type APIPromiseType<T> = Promise<T> & {
   _thenUnwrap: <U>(onFulfilled: (value: T) => U) => APIPromiseType<U>;
 };
-import {
-  wrapImageGeneration,
-  wrapImageEdit,
-  wrapImageVariation,
-} from "./image-wrappers";
+
+// Metric name following OpenTelemetry Gen AI semantic conventions
+const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
 
 export class OpenAIInstrumentation extends InstrumentationBase {
   declare protected _config: OpenAIInstrumentationConfig;
+  private _tokenUsageHistogram!: Histogram;
 
   constructor(config: OpenAIInstrumentationConfig = {}) {
     super("@traceloop/instrumentation-openai", version, config);
+    this._initMetrics();
+  }
+
+  private _initMetrics(): void {
+    const meter = metrics.getMeter(
+      "@traceloop/instrumentation-openai",
+      version,
+    );
+    this._tokenUsageHistogram = meter.createHistogram(
+      METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
+      {
+        description: "Measures number of input and output tokens used",
+        unit: "{token}",
+      },
+    );
   }
 
   public override setConfig(config: OpenAIInstrumentationConfig = {}) {
@@ -660,9 +687,23 @@ export class OpenAIInstrumentation extends InstrumentationBase {
     span,
     type,
     result,
+    provider,
+    requestModel,
   }:
-    | { span: Span; type: "chat"; result: ChatCompletion }
-    | { span: Span; type: "completion"; result: Completion }) {
+    | {
+        span: Span;
+        type: "chat";
+        result: ChatCompletion;
+        provider?: string;
+        requestModel?: string;
+      }
+    | {
+        span: Span;
+        type: "completion";
+        result: Completion;
+        provider?: string;
+        requestModel?: string;
+      }) {
     try {
       span.setAttribute(ATTR_GEN_AI_RESPONSE_MODEL, result.model);
       if (result.usage) {
@@ -678,6 +719,29 @@ export class OpenAIInstrumentation extends InstrumentationBase {
           ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
           result.usage?.prompt_tokens,
         );
+
+        // Emit token usage metrics
+        const metricAttributes = {
+          [ATTR_GEN_AI_SYSTEM]: provider || "openai",
+          [ATTR_GEN_AI_REQUEST_MODEL]: requestModel || result.model,
+          [ATTR_GEN_AI_RESPONSE_MODEL]: result.model,
+        };
+
+        // Record input tokens
+        if (result.usage.prompt_tokens !== undefined) {
+          this._tokenUsageHistogram.record(result.usage.prompt_tokens, {
+            ...metricAttributes,
+            "gen_ai.token.type": "input",
+          });
+        }
+
+        // Record output tokens
+        if (result.usage.completion_tokens !== undefined) {
+          this._tokenUsageHistogram.record(result.usage.completion_tokens, {
+            ...metricAttributes,
+            "gen_ai.token.type": "output",
+          });
+        }
       }
 
       if (this._shouldSendPrompts()) {

@@ -19,7 +19,13 @@ import { Serialized } from "@langchain/core/load/serializable";
 import { BaseMessage } from "@langchain/core/messages";
 import { LLMResult } from "@langchain/core/outputs";
 import { ChainValues } from "@langchain/core/utils/types";
-import { SpanKind, SpanStatusCode, Tracer } from "@opentelemetry/api";
+import {
+  Histogram,
+  SpanKind,
+  SpanStatusCode,
+  Tracer,
+  metrics,
+} from "@opentelemetry/api";
 import {
   ATTR_GEN_AI_COMPLETION,
   ATTR_GEN_AI_OPERATION_NAME,
@@ -31,6 +37,9 @@ import {
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
 import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
+
+// Metric name following OpenTelemetry Gen AI semantic conventions
+const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
 
 interface SpanData {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -48,11 +57,22 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
   private tracer: Tracer;
   private spans: Map<string, SpanData> = new Map();
   private traceContent: boolean;
+  private _tokenUsageHistogram: Histogram;
 
   constructor(tracer: Tracer, traceContent = true) {
     super();
     this.tracer = tracer;
     this.traceContent = traceContent;
+
+    // Initialize metrics
+    const meter = metrics.getMeter("@traceloop/instrumentation-langchain");
+    this._tokenUsageHistogram = meter.createHistogram(
+      METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
+      {
+        description: "Measures number of input and output tokens used",
+        unit: "{token}",
+      },
+    );
   }
 
   override async handleChatModelStart(
@@ -270,6 +290,27 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
           [SpanAttributes.LLM_USAGE_TOTAL_TOKENS]: totalTokens,
         });
       }
+
+      // Emit token usage metrics
+      const metricAttributes = {
+        [ATTR_GEN_AI_SYSTEM]:
+          span.getAttribute?.(ATTR_GEN_AI_SYSTEM) || "langchain",
+        [ATTR_GEN_AI_REQUEST_MODEL]: modelName || "unknown",
+        [ATTR_GEN_AI_RESPONSE_MODEL]: modelName || "unknown",
+      };
+
+      if (usage.input_tokens) {
+        this._tokenUsageHistogram.record(usage.input_tokens, {
+          ...metricAttributes,
+          "gen_ai.token.type": "input",
+        });
+      }
+      if (usage.output_tokens) {
+        this._tokenUsageHistogram.record(usage.output_tokens, {
+          ...metricAttributes,
+          "gen_ai.token.type": "output",
+        });
+      }
     }
 
     // Also check for tokenUsage format (for compatibility)
@@ -288,6 +329,27 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       if (usage.totalTokens) {
         span.setAttributes({
           [SpanAttributes.LLM_USAGE_TOTAL_TOKENS]: usage.totalTokens,
+        });
+      }
+
+      // Emit token usage metrics for tokenUsage format
+      const metricAttributes = {
+        [ATTR_GEN_AI_SYSTEM]:
+          span.getAttribute?.(ATTR_GEN_AI_SYSTEM) || "langchain",
+        [ATTR_GEN_AI_REQUEST_MODEL]: modelName || "unknown",
+        [ATTR_GEN_AI_RESPONSE_MODEL]: modelName || "unknown",
+      };
+
+      if (usage.promptTokens) {
+        this._tokenUsageHistogram.record(usage.promptTokens, {
+          ...metricAttributes,
+          "gen_ai.token.type": "input",
+        });
+      }
+      if (usage.completionTokens) {
+        this._tokenUsageHistogram.record(usage.completionTokens, {
+          ...metricAttributes,
+          "gen_ai.token.type": "output",
         });
       }
     }

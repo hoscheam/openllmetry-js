@@ -1,8 +1,10 @@
 import { TraceExporter as GcpTraceExporter } from "@google-cloud/opentelemetry-cloud-trace-exporter";
 import { context, diag } from "@opentelemetry/api";
+import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { Instrumentation } from "@opentelemetry/instrumentation";
 import { Resource } from "@opentelemetry/resources";
+import { PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { SpanProcessor } from "@opentelemetry/sdk-trace-node";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
@@ -333,12 +335,33 @@ export const startTracing = (options: InitializeOptions) => {
       options.appName || process.env.npm_package_name || "unknown_service",
   });
 
+  // Configure metrics exporter for gen_ai.client.token.usage metric
+  // Metrics are enabled by default unless explicitly disabled
+  const metricsEnabled = options.metricsEnabled !== false;
+  let metricReader;
+
+  if (metricsEnabled) {
+    // Use custom metrics exporter if provided, otherwise use default OTLP exporter
+    const metricsExporter =
+      options.metricsExporter ??
+      new OTLPMetricExporter({
+        url: `${baseUrl}/v1/metrics`,
+        headers,
+      });
+
+    metricReader = new PeriodicExportingMetricReader({
+      exporter: metricsExporter,
+      exportIntervalMillis: options.metricsExportIntervalMs || 60000, // Default: 60 seconds
+    });
+  }
+
   _sdk = new NodeSDK({
     resource,
     spanProcessors,
     contextManager: options.contextManager,
     textMapPropagator: options.propagator,
     traceExporter,
+    ...(metricReader && { metricReader }),
     instrumentations,
     // We should re-consider removing irrelevant spans here in the future
     // sampler: new TraceloopSampler(),

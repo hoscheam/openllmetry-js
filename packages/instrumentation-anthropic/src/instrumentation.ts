@@ -13,13 +13,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import type * as anthropic from "@anthropic-ai/sdk";
+import type { APIPromise, BaseAnthropic } from "@anthropic-ai/sdk";
+import type { MessageCreateParamsNonStreaming as BetaMessageCreateParamsNonStreaming } from "@anthropic-ai/sdk/resources/beta/messages";
+import type {
+  Completion,
+  CompletionCreateParamsNonStreaming,
+  CompletionCreateParamsStreaming,
+} from "@anthropic-ai/sdk/resources/completions";
+import type {
+  Message,
+  MessageCreateParamsNonStreaming,
+  MessageCreateParamsStreaming,
+  MessageStreamEvent,
+} from "@anthropic-ai/sdk/resources/messages";
+import type { Stream } from "@anthropic-ai/sdk/streaming";
 import {
-  context,
-  trace,
-  Span,
   Attributes,
+  Histogram,
+  Span,
   SpanKind,
   SpanStatusCode,
+  context,
+  metrics,
+  trace,
 } from "@opentelemetry/api";
 import {
   InstrumentationBase,
@@ -27,10 +44,6 @@ import {
   InstrumentationNodeModuleDefinition,
   safeExecuteInTheMiddle,
 } from "@opentelemetry/instrumentation";
-import {
-  CONTEXT_KEY_ALLOW_TRACE_CONTENT,
-  SpanAttributes,
-} from "@traceloop/ai-semantic-conventions";
 import {
   ATTR_GEN_AI_COMPLETION,
   ATTR_GEN_AI_PROMPT,
@@ -43,29 +56,37 @@ import {
   ATTR_GEN_AI_USAGE_COMPLETION_TOKENS,
   ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
 } from "@opentelemetry/semantic-conventions/incubating";
-import { AnthropicInstrumentationConfig } from "./types";
+import {
+  CONTEXT_KEY_ALLOW_TRACE_CONTENT,
+  SpanAttributes,
+} from "@traceloop/ai-semantic-conventions";
 import { version } from "../package.json";
-import type * as anthropic from "@anthropic-ai/sdk";
-import type {
-  CompletionCreateParamsNonStreaming,
-  CompletionCreateParamsStreaming,
-  Completion,
-} from "@anthropic-ai/sdk/resources/completions";
-import type {
-  MessageCreateParamsNonStreaming,
-  MessageCreateParamsStreaming,
-  Message,
-  MessageStreamEvent,
-} from "@anthropic-ai/sdk/resources/messages";
-import type { MessageCreateParamsNonStreaming as BetaMessageCreateParamsNonStreaming } from "@anthropic-ai/sdk/resources/beta/messages";
-import type { Stream } from "@anthropic-ai/sdk/streaming";
-import type { APIPromise, BaseAnthropic } from "@anthropic-ai/sdk";
+import { AnthropicInstrumentationConfig } from "./types";
+
+// Metric name following OpenTelemetry Gen AI semantic conventions
+const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
 
 export class AnthropicInstrumentation extends InstrumentationBase {
   declare protected _config: AnthropicInstrumentationConfig;
+  private _tokenUsageHistogram!: Histogram;
 
   constructor(config: AnthropicInstrumentationConfig = {}) {
     super("@traceloop/instrumentation-anthropic", version, config);
+    this._initMetrics();
+  }
+
+  private _initMetrics(): void {
+    const meter = metrics.getMeter(
+      "@traceloop/instrumentation-anthropic",
+      version,
+    );
+    this._tokenUsageHistogram = meter.createHistogram(
+      METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
+      {
+        description: "Measures number of input and output tokens used",
+        unit: "{token}",
+      },
+    );
   }
 
   public override setConfig(config: AnthropicInstrumentationConfig = {}) {
@@ -501,6 +522,29 @@ export class AnthropicInstrumentation extends InstrumentationBase {
           ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
           result.usage?.input_tokens,
         );
+
+        // Emit token usage metrics
+        const metricAttributes = {
+          [ATTR_GEN_AI_SYSTEM]: "anthropic",
+          [ATTR_GEN_AI_REQUEST_MODEL]: result.model,
+          [ATTR_GEN_AI_RESPONSE_MODEL]: result.model,
+        };
+
+        // Record input tokens
+        if (result.usage.input_tokens !== undefined) {
+          this._tokenUsageHistogram.record(result.usage.input_tokens, {
+            ...metricAttributes,
+            "gen_ai.token.type": "input",
+          });
+        }
+
+        // Record output tokens
+        if (result.usage.output_tokens !== undefined) {
+          this._tokenUsageHistogram.record(result.usage.output_tokens, {
+            ...metricAttributes,
+            "gen_ai.token.type": "output",
+          });
+        }
       }
 
       if (result.stop_reason) {
