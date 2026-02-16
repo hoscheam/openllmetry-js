@@ -42,6 +42,12 @@ import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
 const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
 const METRIC_GEN_AI_CLIENT_OPERATION_DURATION =
   "gen_ai.client.operation.duration";
+const METRIC_GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN =
+  "gen_ai.client.time_to_first_token";
+// Additional metric names for compatibility (Dynatrace nvidia_nim/vllm format)
+const METRIC_TIME_TO_FIRST_TOKEN_SECONDS = "time_to_first_token_seconds";
+const METRIC_VLLM_TIME_TO_FIRST_TOKEN_SECONDS =
+  "vllm_time_to_first_token_seconds";
 
 interface SpanData {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -61,6 +67,9 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
   private traceContent: boolean;
   private _tokenUsageHistogram: Histogram;
   private _operationDurationHistogram: Histogram;
+  private _timeToFirstTokenHistogram: Histogram;
+  private _timeToFirstTokenSecondsHistogram: Histogram;
+  private _vllmTimeToFirstTokenSecondsHistogram: Histogram;
 
   constructor(tracer: Tracer, traceContent = true) {
     super();
@@ -80,6 +89,32 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
       METRIC_GEN_AI_CLIENT_OPERATION_DURATION,
       {
         description: "Measures the duration of GenAI operations",
+        unit: "s",
+      },
+    );
+    this._timeToFirstTokenHistogram = meter.createHistogram(
+      METRIC_GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN,
+      {
+        description:
+          "Measures the time from request start to receiving the first token",
+        unit: "s",
+      },
+    );
+    // Additional histogram for Dynatrace compatibility (nvidia_nim/vllm format)
+    this._timeToFirstTokenSecondsHistogram = meter.createHistogram(
+      METRIC_TIME_TO_FIRST_TOKEN_SECONDS,
+      {
+        description:
+          "Measures the time to first token in seconds (Dynatrace compatible)",
+        unit: "s",
+      },
+    );
+    // vLLM-style histogram (alias with same value for Dynatrace formula compatibility)
+    this._vllmTimeToFirstTokenSecondsHistogram = meter.createHistogram(
+      METRIC_VLLM_TIME_TO_FIRST_TOKEN_SECONDS,
+      {
+        description:
+          "Measures the time to first token in seconds (vLLM format for Dynatrace)",
         unit: "s",
       },
     );
@@ -210,13 +245,45 @@ export class TraceloopCallbackHandler extends BaseCallbackHandler {
     // Record first token time if not already set
     if (!spanData.firstTokenTime) {
       spanData.firstTokenTime = Date.now();
-      const timeToFirstToken = spanData.firstTokenTime - spanData.startTime;
+      const timeToFirstTokenMs = spanData.firstTokenTime - spanData.startTime;
+      const timeToFirstTokenSeconds = timeToFirstTokenMs / 1000;
 
-      // Set time to first token attribute (in milliseconds)
+      // Set time to first token attribute (in milliseconds and seconds)
       spanData.span.setAttributes({
-        "gen_ai.response.time_to_first_token_ms": timeToFirstToken,
-        "llm.response.time_to_first_token": timeToFirstToken / 1000, // Also in seconds
+        "gen_ai.response.time_to_first_token_ms": timeToFirstTokenMs,
+        "llm.response.time_to_first_token": timeToFirstTokenSeconds,
+        // Standard OpenTelemetry Gen AI attribute
+        "gen_ai.server.time_to_first_token": timeToFirstTokenSeconds,
       });
+
+      // Record time to first token metrics
+      const metricAttributes = {
+        [ATTR_GEN_AI_SYSTEM]:
+          spanData.span.getAttribute?.(ATTR_GEN_AI_SYSTEM) || "langchain",
+        [ATTR_GEN_AI_REQUEST_MODEL]:
+          spanData.modelFromConfig ||
+          spanData.span.getAttribute?.(ATTR_GEN_AI_REQUEST_MODEL) ||
+          "unknown",
+        [ATTR_GEN_AI_OPERATION_NAME]: "chat",
+      };
+
+      // Record in gen_ai.client.time_to_first_token histogram (in seconds)
+      this._timeToFirstTokenHistogram.record(
+        timeToFirstTokenSeconds,
+        metricAttributes,
+      );
+
+      // Record in time_to_first_token_seconds histogram (Dynatrace compatible)
+      this._timeToFirstTokenSecondsHistogram.record(
+        timeToFirstTokenSeconds,
+        metricAttributes,
+      );
+
+      // Record in vllm_time_to_first_token_seconds histogram (Dynatrace vllm format)
+      this._vllmTimeToFirstTokenSecondsHistogram.record(
+        timeToFirstTokenSeconds,
+        metricAttributes,
+      );
     }
   }
 

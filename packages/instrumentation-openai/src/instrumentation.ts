@@ -72,10 +72,12 @@ type APIPromiseType<T> = Promise<T> & {
 
 // Metric name following OpenTelemetry Gen AI semantic conventions
 const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
+const METRIC_GEN_AI_PROMPT_CACHING = "gen_ai.prompt.caching";
 
 export class OpenAIInstrumentation extends InstrumentationBase {
   declare protected _config: OpenAIInstrumentationConfig;
   private _tokenUsageHistogram!: Histogram;
+  private _promptCachingHistogram!: Histogram;
 
   constructor(config: OpenAIInstrumentationConfig = {}) {
     super("@traceloop/instrumentation-openai", version, config);
@@ -91,6 +93,14 @@ export class OpenAIInstrumentation extends InstrumentationBase {
       METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
       {
         description: "Measures number of input and output tokens used",
+        unit: "{token}",
+      },
+    );
+    this._promptCachingHistogram = meter.createHistogram(
+      METRIC_GEN_AI_PROMPT_CACHING,
+      {
+        description:
+          "Measures number of tokens used for prompt caching (read/create)",
         unit: "{token}",
       },
     );
@@ -741,6 +751,29 @@ export class OpenAIInstrumentation extends InstrumentationBase {
             ...metricAttributes,
             "gen_ai.token.type": "output",
           });
+        }
+
+        // Record prompt caching metrics for Dynatrace compatibility
+        // OpenAI provides cached_tokens in prompt_tokens_details
+        const promptTokensDetails = (result.usage as any)
+          ?.prompt_tokens_details;
+        if (
+          promptTokensDetails?.cached_tokens !== undefined &&
+          promptTokensDetails.cached_tokens > 0
+        ) {
+          this._promptCachingHistogram.record(
+            promptTokensDetails.cached_tokens,
+            {
+              ...metricAttributes,
+              "gen_ai.cache.type": "read",
+            },
+          );
+
+          // Also set span attribute
+          span.setAttribute(
+            SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+            promptTokensDetails.cached_tokens,
+          );
         }
       }
 

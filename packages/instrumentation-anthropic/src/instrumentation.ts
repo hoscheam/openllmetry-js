@@ -65,10 +65,12 @@ import { AnthropicInstrumentationConfig } from "./types";
 
 // Metric name following OpenTelemetry Gen AI semantic conventions
 const METRIC_GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage";
+const METRIC_GEN_AI_PROMPT_CACHING = "gen_ai.prompt.caching";
 
 export class AnthropicInstrumentation extends InstrumentationBase {
   declare protected _config: AnthropicInstrumentationConfig;
   private _tokenUsageHistogram!: Histogram;
+  private _promptCachingHistogram!: Histogram;
 
   constructor(config: AnthropicInstrumentationConfig = {}) {
     super("@traceloop/instrumentation-anthropic", version, config);
@@ -84,6 +86,14 @@ export class AnthropicInstrumentation extends InstrumentationBase {
       METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
       {
         description: "Measures number of input and output tokens used",
+        unit: "{token}",
+      },
+    );
+    this._promptCachingHistogram = meter.createHistogram(
+      METRIC_GEN_AI_PROMPT_CACHING,
+      {
+        description:
+          "Measures number of tokens used for prompt caching (read/create)",
         unit: "{token}",
       },
     );
@@ -544,6 +554,47 @@ export class AnthropicInstrumentation extends InstrumentationBase {
             ...metricAttributes,
             "gen_ai.token.type": "output",
           });
+        }
+
+        // Record prompt caching metrics for Dynatrace compatibility
+        if (
+          result.usage.cache_read_input_tokens !== undefined &&
+          result.usage.cache_read_input_tokens !== null &&
+          result.usage.cache_read_input_tokens > 0
+        ) {
+          this._promptCachingHistogram.record(
+            result.usage.cache_read_input_tokens,
+            {
+              ...metricAttributes,
+              "gen_ai.cache.type": "read",
+            },
+          );
+
+          // Also set span attribute
+          span.setAttribute(
+            SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+            result.usage.cache_read_input_tokens,
+          );
+        }
+
+        if (
+          result.usage.cache_creation_input_tokens !== undefined &&
+          result.usage.cache_creation_input_tokens !== null &&
+          result.usage.cache_creation_input_tokens > 0
+        ) {
+          this._promptCachingHistogram.record(
+            result.usage.cache_creation_input_tokens,
+            {
+              ...metricAttributes,
+              "gen_ai.cache.type": "create",
+            },
+          );
+
+          // Also set span attribute
+          span.setAttribute(
+            SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+            result.usage.cache_creation_input_tokens,
+          );
         }
       }
 

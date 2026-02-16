@@ -1,33 +1,57 @@
-import {
-  SimpleSpanProcessor,
-  BatchSpanProcessor,
-  SpanProcessor,
-  Span,
-  ReadableSpan,
-} from "@opentelemetry/sdk-trace-node";
-import { context } from "@opentelemetry/api";
+import { context, Histogram, metrics } from "@opentelemetry/api";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { SpanExporter } from "@opentelemetry/sdk-trace-base";
 import {
-  ASSOCATION_PROPERTIES_KEY,
-  ENTITY_NAME_KEY,
-  WORKFLOW_NAME_KEY,
-  AGENT_NAME_KEY,
-  CONVERSATION_ID_KEY,
-} from "./tracing";
-import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
+  BatchSpanProcessor,
+  ReadableSpan,
+  SimpleSpanProcessor,
+  Span,
+  SpanProcessor,
+} from "@opentelemetry/sdk-trace-node";
 import {
   ATTR_GEN_AI_AGENT_NAME,
   ATTR_GEN_AI_CONVERSATION_ID,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_GEN_AI_RESPONSE_MODEL,
+  ATTR_GEN_AI_SYSTEM,
 } from "@opentelemetry/semantic-conventions/incubating";
+import { SpanAttributes } from "@traceloop/ai-semantic-conventions";
 import {
   transformAiSdkSpanAttributes,
   transformAiSdkSpanNames,
 } from "./ai-sdk-transformations";
 import { parseKeyPairsIntoRecord } from "./baggage-utils";
+import {
+  AGENT_NAME_KEY,
+  ASSOCATION_PROPERTIES_KEY,
+  CONVERSATION_ID_KEY,
+  ENTITY_NAME_KEY,
+  WORKFLOW_NAME_KEY,
+} from "./tracing";
 
 export const ALL_INSTRUMENTATION_LIBRARIES = "all" as const;
 type AllInstrumentationLibraries = typeof ALL_INSTRUMENTATION_LIBRARIES;
+
+// Metric name for prompt caching (Dynatrace compatibility)
+const METRIC_GEN_AI_PROMPT_CACHING = "gen_ai.prompt.caching";
+
+// Lazy-initialized histogram for prompt caching metrics
+let promptCachingHistogram: Histogram | undefined;
+
+const getPromptCachingHistogram = (): Histogram => {
+  if (!promptCachingHistogram) {
+    const meter = metrics.getMeter("@traceloop/node-server-sdk");
+    promptCachingHistogram = meter.createHistogram(
+      METRIC_GEN_AI_PROMPT_CACHING,
+      {
+        description:
+          "Measures number of tokens used for prompt caching (read/create)",
+        unit: "{token}",
+      },
+    );
+  }
+  return promptCachingHistogram;
+};
 
 const spanAgentNames = new Map<
   string,
@@ -284,6 +308,9 @@ const onSpanEnd = (
 
     transformAiSdkSpanAttributes(span);
 
+    // Record prompt caching metrics for Dynatrace compatibility
+    recordPromptCachingMetrics(span);
+
     const spanId = span.spanContext().spanId;
     const parentSpanId = span.parentSpanContext?.spanId;
     let agentName = span.attributes[ATTR_GEN_AI_AGENT_NAME];
@@ -314,4 +341,67 @@ const onSpanEnd = (
 
     originalOnEnd(compatibleSpan);
   };
+};
+
+/**
+ * Records prompt caching metrics from AI SDK span attributes
+ * Emits gen_ai.prompt.caching metric with gen_ai.cache.type dimension
+ */
+const recordPromptCachingMetrics = (span: ReadableSpan): void => {
+  const cacheReadTokens =
+    span.attributes[SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS];
+  const cacheCreateTokens =
+    span.attributes[SpanAttributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS];
+
+  if (!cacheReadTokens && !cacheCreateTokens) {
+    return;
+  }
+
+  const histogram = getPromptCachingHistogram();
+
+  const metricAttributes: Record<string, string> = {};
+
+  // Add gen_ai.system if available
+  const genAiSystem = span.attributes[ATTR_GEN_AI_SYSTEM];
+  if (genAiSystem && typeof genAiSystem === "string") {
+    metricAttributes[ATTR_GEN_AI_SYSTEM] = genAiSystem;
+  }
+
+  // Add gen_ai.request.model if available
+  const requestModel = span.attributes[ATTR_GEN_AI_REQUEST_MODEL];
+  if (requestModel && typeof requestModel === "string") {
+    metricAttributes[ATTR_GEN_AI_REQUEST_MODEL] = requestModel;
+  }
+
+  // Add gen_ai.response.model if available
+  const responseModel = span.attributes[ATTR_GEN_AI_RESPONSE_MODEL];
+  if (responseModel && typeof responseModel === "string") {
+    metricAttributes[ATTR_GEN_AI_RESPONSE_MODEL] = responseModel;
+  }
+
+  // Record cache read tokens metric
+  if (
+    cacheReadTokens !== undefined &&
+    cacheReadTokens !== null &&
+    typeof cacheReadTokens === "number" &&
+    cacheReadTokens > 0
+  ) {
+    histogram.record(cacheReadTokens, {
+      ...metricAttributes,
+      "gen_ai.cache.type": "read",
+    });
+  }
+
+  // Record cache creation tokens metric
+  if (
+    cacheCreateTokens !== undefined &&
+    cacheCreateTokens !== null &&
+    typeof cacheCreateTokens === "number" &&
+    cacheCreateTokens > 0
+  ) {
+    histogram.record(cacheCreateTokens, {
+      ...metricAttributes,
+      "gen_ai.cache.type": "create",
+    });
+  }
 };
